@@ -42,6 +42,39 @@ export const PLATFORM_SIZES = {
 export type PlatformKey = keyof typeof PLATFORM_SIZES;
 
 /**
+ * 根据视频尺寸和时长动态计算比特率
+ * @param width 视频宽度
+ * @param height 视频高度
+ * @param duration 视频时长（秒）
+ * @param targetFileSizeMB 目标文件大小（MB），默认2MB
+ * @returns 动态计算的比特率（bps）
+ */
+function calculateDynamicBitrate(
+  width: number,
+  height: number,
+  duration: number,
+  targetFileSizeMB: number = 2
+): number {
+  const targetFileSizeBytes = targetFileSizeMB * 1024 * 1024;
+  const totalSeconds = Math.min(duration, 20);
+  
+  const pixelCount = width * height;
+  const pixelsPerSecond = pixelCount * 30;
+  
+  const baseBitrate = pixelsPerSecond * 0.5;
+  const targetBitrate = (targetFileSizeBytes * 8) / totalSeconds;
+  
+  const minBitrate = 500000;
+  const maxBitrate = 8000000;
+  
+  let finalBitrate = Math.min(baseBitrate, targetBitrate);
+  finalBitrate = Math.max(minBitrate, finalBitrate);
+  finalBitrate = Math.min(maxBitrate, finalBitrate);
+  
+  return Math.floor(finalBitrate);
+}
+
+/**
  * 从视频文件提取第一帧PNG
  */
 export async function extractFirstFrame(videoFile: File): Promise<Blob | null> {
@@ -260,15 +293,24 @@ export async function convertSuitVideo(
         video.onerror = () => { clearTimeout(timeout); rej(new Error("视频加载失败")); };
       });
 
+      const duration = video.duration;
+      const width = 656;
+      const height = 494;
+
+      const targetSizeMB = 2;
+      const dynamicBitrate = calculateDynamicBitrate(width, height, duration, targetSizeMB);
+      
+      onProgress({ percent: 20, text: `动态计算比特率: ${(dynamicBitrate / 1000000).toFixed(2)} Mbps` });
+
       onProgress({ percent: 30, text: "创建画布..." });
 
       const canvas = document.createElement("canvas");
-      canvas.width = 656;
-      canvas.height = 494;
+      canvas.width = width;
+      canvas.height = height;
       const ctx = canvas.getContext("2d");
       if (!ctx) throw new Error("无法创建Canvas上下文");
 
-      onProgress({ percent: 50, text: "开始录制视频..." });
+      onProgress({ percent: 40, text: "开始录制视频..." });
 
       const canvasStream = canvas.captureStream(30);
       let combinedStream: MediaStream = canvasStream;
@@ -295,7 +337,7 @@ export async function convertSuitVideo(
 
       const mediaRecorder = new MediaRecorder(combinedStream, {
         mimeType,
-        videoBitsPerSecond: 2500000,
+        videoBitsPerSecond: dynamicBitrate,
       });
 
       const chunks: BlobPart[] = [];
@@ -322,14 +364,21 @@ export async function convertSuitVideo(
       const videoBlob = new Blob(chunks, { type: mimeType });
       const previewUrl = URL.createObjectURL(videoBlob);
 
-      onProgress({ percent: 100, text: "转换完成！" });
+      const fileSizeMB = videoBlob.size / 1024 / 1024;
+      const maxFileSizeMB = 5;
+
+      if (fileSizeMB > maxFileSizeMB) {
+        onProgress({ percent: 95, text: `文件较大 (${fileSizeMB.toFixed(2)}MB)，考虑优化...` });
+      }
+
+      onProgress({ percent: 100, text: `转换完成！(${fileSizeMB.toFixed(2)} MB)` });
 
       URL.revokeObjectURL(tempUrl);
 
       resolve({
         blob: videoBlob,
         url: previewUrl,
-        fileSize: `${(videoBlob.size / 1024 / 1024).toFixed(2)} MB`,
+        fileSize: `${fileSizeMB.toFixed(2)} MB`,
         extension: fileExtension,
       });
     } catch (err) {
