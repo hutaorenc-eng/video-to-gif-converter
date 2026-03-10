@@ -1,38 +1,3 @@
-/*
- * GIF转换引擎 - 浏览器端视频转GIF核心逻辑
- * 支持帧率、抽帧间隔、播放速度参数调节
- */
-
-import gifshot from "gifshot";
-
-export interface GifParams {
-  fps: number;        // 帧率（秒/帧），如0.17
-  frameSkip: number;  // 抽帧间隔，1=不跳帧
-  playbackSpeed: number; // 播放速度倍率
-}
-
-export interface GifResult {
-  blob: Blob;
-  url: string;
-  width: number;
-  height: number;
-  fileSize: string;
-  params: GifParams;
-  actualInterval: string;
-}
-
-export interface ConvertProgress {
-  percent: number;
-  text: string;
-}
-
-export const DEFAULT_PARAMS: GifParams = {
-  fps: 0.17,
-  frameSkip: 2,
-  playbackSpeed: 1.4,
-};
-
-// 平台尺寸定义
 export const PLATFORM_SIZES = {
   android: { width: 364, height: 285 },
   ios9: { width: 364, height: 274 },
@@ -40,39 +5,6 @@ export const PLATFORM_SIZES = {
 } as const;
 
 export type PlatformKey = keyof typeof PLATFORM_SIZES;
-
-/**
- * 根据视频尺寸和时长动态计算比特率
- * @param width 视频宽度
- * @param height 视频高度
- * @param duration 视频时长（秒）
- * @param targetFileSizeMB 目标文件大小（MB），默认2MB
- * @returns 动态计算的比特率（bps）
- */
-function calculateDynamicBitrate(
-  width: number,
-  height: number,
-  duration: number,
-  targetFileSizeMB: number = 2
-): number {
-  const targetFileSizeBytes = targetFileSizeMB * 1024 * 1024;
-  const totalSeconds = Math.min(duration, 20);
-  
-  const pixelCount = width * height;
-  const pixelsPerSecond = pixelCount * 30;
-  
-  const baseBitrate = pixelsPerSecond * 0.5;
-  const targetBitrate = (targetFileSizeBytes * 8) / totalSeconds;
-  
-  const minBitrate = 500000;
-  const maxBitrate = 8000000;
-  
-  let finalBitrate = Math.min(baseBitrate, targetBitrate);
-  finalBitrate = Math.max(minBitrate, finalBitrate);
-  finalBitrate = Math.min(maxBitrate, finalBitrate);
-  
-  return Math.floor(finalBitrate);
-}
 
 /**
  * 从视频文件提取第一帧PNG
@@ -238,6 +170,12 @@ export async function convertVideoToGif(
               ia[i] = byteString.charCodeAt(i);
             }
             const blob = new Blob([ab], { type: "image/gif" });
+
+            // 验证GIF大小
+            const sizeWarning = blob.size > VIDEO_SIZE_LIMITS.gif.maxSizeBytes
+              ? ` (警告: 超过${VIDEO_SIZE_LIMITS.gif.maxSizeMB}MB限制)`
+              : "";
+
             const url = URL.createObjectURL(blob);
 
             onProgress({ percent: 100, text: "转换完成！" });
@@ -248,8 +186,8 @@ export async function convertVideoToGif(
               width,
               height,
               fileSize: blob.size < 1024 * 1024
-                ? `${(blob.size / 1024).toFixed(1)} KB`
-                : `${(blob.size / 1024 / 1024).toFixed(2)} MB`,
+                ? `${(blob.size / 1024).toFixed(1)} KB${sizeWarning}`
+                : `${(blob.size / 1024 / 1024).toFixed(2)} MB${sizeWarning}`,
               params: { ...params },
               actualInterval: `${gifInterval.toFixed(3)}秒/帧`,
             });
@@ -271,11 +209,14 @@ export async function convertVideoToGif(
 
 /**
  * 转换套装视频（656×494）
+ * 输出视频大小限制：1.5MB
  */
 export async function convertSuitVideo(
   videoFile: File,
   onProgress: (p: ConvertProgress) => void
-): Promise<{ blob: Blob; url: string; fileSize: string; extension: string }> {
+): Promise<{ blob: Blob; url: string; fileSize: string; extension: string; bitrate?: number }> {
+  const { maxSizeMB, maxSizeBytes, safetyFactor, minBitrate, maxBitrate } = VIDEO_SIZE_LIMITS.suitVideo;
+
   return new Promise(async (resolve, reject) => {
     try {
       onProgress({ percent: 10, text: "加载视频..." });
@@ -293,24 +234,33 @@ export async function convertSuitVideo(
         video.onerror = () => { clearTimeout(timeout); rej(new Error("视频加载失败")); };
       });
 
+      // 获取视频时长
       const duration = video.duration;
-      const width = 656;
-      const height = 494;
+      if (!duration || duration <= 0 || !isFinite(duration)) {
+        throw new Error("无法获取视频时长");
+      }
 
-      const targetSizeMB = 2;
-      const dynamicBitrate = calculateDynamicBitrate(width, height, duration, targetSizeMB);
-      
-      onProgress({ percent: 20, text: `动态计算比特率: ${(dynamicBitrate / 1000000).toFixed(2)} Mbps` });
+      // 动态计算比特率
+      const targetBits = maxSizeBytes * 8 * safetyFactor;
+      let calculatedBitrate = Math.floor(targetBits / duration);
+      calculatedBitrate = Math.max(minBitrate, Math.min(maxBitrate, calculatedBitrate));
 
-      onProgress({ percent: 30, text: "创建画布..." });
+      // 检查视频是否过长
+      const maxDurationForMinBitrate = Math.floor(targetBits / minBitrate);
+      if (duration > maxDurationForMinBitrate) {
+        reject(new Error(`视频时长(${duration.toFixed(1)}秒)过长，建议不超过${maxDurationForMinBitrate}秒以保证输出小于${maxSizeMB}MB`));
+        return;
+      }
+
+      onProgress({ percent: 30, text: `计算最佳参数 (比特率: ${(calculatedBitrate / 1000000).toFixed(2)}Mbps)...` });
 
       const canvas = document.createElement("canvas");
-      canvas.width = width;
-      canvas.height = height;
+      canvas.width = 656;
+      canvas.height = 494;
       const ctx = canvas.getContext("2d");
       if (!ctx) throw new Error("无法创建Canvas上下文");
 
-      onProgress({ percent: 40, text: "开始录制视频..." });
+      onProgress({ percent: 50, text: "开始录制视频..." });
 
       const canvasStream = canvas.captureStream(30);
       let combinedStream: MediaStream = canvasStream;
@@ -335,9 +285,10 @@ export async function convertSuitVideo(
         fileExtension = "webm";
       }
 
+      // 使用动态计算的比特率
       const mediaRecorder = new MediaRecorder(combinedStream, {
         mimeType,
-        videoBitsPerSecond: dynamicBitrate,
+        videoBitsPerSecond: calculatedBitrate,
       });
 
       const chunks: BlobPart[] = [];
@@ -362,24 +313,25 @@ export async function convertSuitVideo(
       onProgress({ percent: 90, text: "处理视频数据..." });
 
       const videoBlob = new Blob(chunks, { type: mimeType });
-      const previewUrl = URL.createObjectURL(videoBlob);
 
-      const fileSizeMB = videoBlob.size / 1024 / 1024;
-      const maxFileSizeMB = 5;
-
-      if (fileSizeMB > maxFileSizeMB) {
-        onProgress({ percent: 95, text: `文件较大 (${fileSizeMB.toFixed(2)}MB)，考虑优化...` });
+      // 验证输出大小
+      if (videoBlob.size > maxSizeBytes) {
+        const actualSize = (videoBlob.size / 1024 / 1024).toFixed(2);
+        console.warn(`输出视频(${actualSize}MB)超过目标大小(${maxSizeMB}MB)，视频时长: ${duration.toFixed(1)}秒`);
       }
 
-      onProgress({ percent: 100, text: `转换完成！(${fileSizeMB.toFixed(2)} MB)` });
+      const previewUrl = URL.createObjectURL(videoBlob);
+
+      onProgress({ percent: 100, text: "转换完成！" });
 
       URL.revokeObjectURL(tempUrl);
 
       resolve({
         blob: videoBlob,
         url: previewUrl,
-        fileSize: `${fileSizeMB.toFixed(2)} MB`,
+        fileSize: `${(videoBlob.size / 1024 / 1024).toFixed(2)} MB`,
         extension: fileExtension,
+        bitrate: calculatedBitrate,
       });
     } catch (err) {
       reject(err);
