@@ -1,0 +1,13 @@
+[build]
+  command = "rm -rf node_modules package-lock.json && npm install --legacy-peer-deps && npm run build"
+  publish = "dist/public"
+
+[build.environment]
+  NODE_VERSION = "18"
+  NPM_CONFIG_LEGACY_PEER_DEPS = "true"
+  NPM_CONFIG_IGNORE_SCRIPTS = "false"
+
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
